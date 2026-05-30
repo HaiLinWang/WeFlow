@@ -232,6 +232,8 @@ const EXPORT_PROGRESS_UI_FLUSH_INTERVAL_MS = 320
 const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
 const SESSION_MEDIA_METRIC_BATCH_SIZE = 8
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
+const SESSION_MEDIA_METRIC_VISIBLE_REFRESH_LIMIT = 24
+const SESSION_MEDIA_METRIC_TAB_REFRESH_LIMIT = 96
 const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
 const SESSION_DETAIL_BACKGROUND_METRIC_LIMIT_PER_TAB = 96
 const SNS_USER_POST_COUNT_BATCH_SIZE = 12
@@ -2323,6 +2325,7 @@ function ExportPage() {
   const [selectedSessions, setSelectedSessions] = useState<Set<string>>(new Set())
   const [contactsList, setContactsList] = useState<ContactInfo[]>([])
   const [isContactsListLoading, setIsContactsListLoading] = useState(true)
+  const [isRefreshingTableData, setIsRefreshingTableData] = useState(false)
   const [, setContactsDataSource] = useState<ContactsDataSource>(null)
   const [contactsUpdatedAt, setContactsUpdatedAt] = useState<number | null>(null)
   const [avatarCacheUpdatedAt, setAvatarCacheUpdatedAt] = useState<number | null>(null)
@@ -2532,6 +2535,7 @@ function ExportPage() {
   const sessionMediaMetricBackgroundFeedTimerRef = useRef<number | null>(null)
   const sessionMediaMetricPersistTimerRef = useRef<number | null>(null)
   const sessionMediaMetricPendingPersistRef = useRef<Record<string, configService.ExportSessionContentMetricCacheEntry>>({})
+  const sessionVisibleMetricRefreshKeyRef = useRef('')
   const sessionMediaMetricVisibleRangeRef = useRef<{ startIndex: number; endIndex: number }>({
     startIndex: 0,
     endIndex: -1
@@ -4339,6 +4343,60 @@ function ExportPage() {
     const runId = sessionMediaMetricRunIdRef.current
     void runSessionMediaMetricWorker(runId)
   }, [runSessionMediaMetricWorker])
+
+  const refreshSessionMediaMetrics = useCallback(async (
+    sessionIds: string[],
+    options?: { includeRelations?: boolean; preferAccurateSpecialTypes?: boolean }
+  ): Promise<void> => {
+    const normalizedSessionIds = Array.from(new Set(
+      (sessionIds || [])
+        .map((sessionId) => String(sessionId || '').trim())
+        .filter(Boolean)
+    ))
+    if (normalizedSessionIds.length === 0) return
+
+    const includeRelations = options?.includeRelations === true
+    const preferAccurateSpecialTypes = options?.preferAccurateSpecialTypes === true
+    sessionMediaMetricRunIdRef.current += 1
+    const runId = sessionMediaMetricRunIdRef.current
+    sessionMediaMetricQueueRef.current = sessionMediaMetricQueueRef.current.filter(
+      sessionId => !normalizedSessionIds.includes(sessionId)
+    )
+    for (const sessionId of normalizedSessionIds) {
+      sessionMediaMetricQueuedSetRef.current.delete(sessionId)
+      sessionMediaMetricReadySetRef.current.delete(sessionId)
+    }
+
+    for (let index = 0; index < normalizedSessionIds.length; index += SESSION_MEDIA_METRIC_BATCH_SIZE) {
+      if (!isExportRouteRef.current || runId !== sessionMediaMetricRunIdRef.current) return
+      const batchSessionIds = normalizedSessionIds.slice(index, index + SESSION_MEDIA_METRIC_BATCH_SIZE)
+      patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'loading')
+      try {
+        const result = await window.electronAPI.chat.getExportSessionStats(batchSessionIds, {
+          includeRelations,
+          forceRefresh: true,
+          preferAccurateSpecialTypes
+        })
+        if (!isExportRouteRef.current || runId !== sessionMediaMetricRunIdRef.current) return
+        if (result.success && result.data) {
+          applySessionMediaMetricsFromStats(
+            result.data as Record<string, SessionExportMetric>,
+            result.cache as Record<string, SessionExportCacheMeta> | undefined
+          )
+          patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'done')
+        } else {
+          patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'failed', {
+            error: result.error || '统计刷新失败'
+          })
+        }
+      } catch (error) {
+        if (!isExportRouteRef.current || runId !== sessionMediaMetricRunIdRef.current) return
+        patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'failed', {
+          error: String(error)
+        })
+      }
+    }
+  }, [applySessionMediaMetricsFromStats, patchSessionLoadTraceStage])
 
   const loadSessionMutualFriendsMetric = useCallback(async (sessionId: string): Promise<SessionMutualFriendsMetric> => {
     const normalizedSessionId = String(sessionId || '').trim()
@@ -7163,6 +7221,38 @@ function ExportPage() {
 
   useEffect(() => {
     if (!isExportRoute) return
+    if (activeTaskCount > 0) return
+    if (filteredContacts.length === 0) return
+    const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
+      .slice(0, SESSION_MEDIA_METRIC_VISIBLE_REFRESH_LIMIT)
+    if (visibleTargets.length === 0) return
+    const refreshKey = [
+      activeTab,
+      searchKeyword.trim().toLowerCase(),
+      contactsSortConfig.key,
+      contactsSortConfig.order || '',
+      visibleTargets.join(',')
+    ].join('|')
+    if (sessionVisibleMetricRefreshKeyRef.current === refreshKey) return
+    sessionVisibleMetricRefreshKeyRef.current = refreshKey
+    const timer = window.setTimeout(() => {
+      void refreshSessionMediaMetrics(visibleTargets)
+    }, 420)
+    return () => window.clearTimeout(timer)
+  }, [
+    activeTaskCount,
+    activeTab,
+    collectVisibleSessionMetricTargets,
+    contactsSortConfig.key,
+    contactsSortConfig.order,
+    filteredContacts,
+    isExportRoute,
+    refreshSessionMediaMetrics,
+    searchKeyword
+  ])
+
+  useEffect(() => {
+    if (!isExportRoute) return
     if (filteredContacts.length === 0) return
     const bootstrapTargets = filteredContacts.slice(0, 24).map((contact) => contact.username)
     void hydrateVisibleContactAvatars(bootstrapTargets)
@@ -7784,78 +7874,92 @@ function ExportPage() {
   }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
 
   const handleRefreshTableData = useCallback(async () => {
+    if (isRefreshingTableData) return
     const scopeKey = await ensureExportCacheScope()
+    setIsRefreshingTableData(true)
 
-    resetSessionMutualFriendsLoader()
-    sessionMutualFriendsMetricsRef.current = {}
-    setSessionMutualFriendsMetrics({})
-    closeSessionMutualFriendsDialog()
     try {
-      await configService.clearExportSessionMutualFriendsCache(scopeKey)
-    } catch (error) {
-      console.error('清理导出页共同好友缓存失败:', error)
-    }
-
-    if (isSessionCountStageReady) {
-      const visibleTargetIds = collectVisibleSessionMutualFriendsTargets(filteredContacts)
-      const visibleTargetSet = new Set(visibleTargetIds)
-      const remainingTargetIds = sessionsRef.current
-        .filter((session) => session.hasSession && isSingleContactSession(session.username) && !visibleTargetSet.has(session.username))
-        .map((session) => session.username)
-
-      if (visibleTargetIds.length > 0) {
-        enqueueSessionMutualFriendsRequests(visibleTargetIds, { front: true })
+      resetSessionMutualFriendsLoader()
+      sessionMutualFriendsMetricsRef.current = {}
+      setSessionMutualFriendsMetrics({})
+      closeSessionMutualFriendsDialog()
+      try {
+        await configService.clearExportSessionMutualFriendsCache(scopeKey)
+      } catch (error) {
+        console.error('清理导出页共同好友缓存失败:', error)
       }
-      if (remainingTargetIds.length > 0) {
-        enqueueSessionMutualFriendsRequests(remainingTargetIds)
+
+      if (isSessionCountStageReady) {
+        const visibleTargetIds = collectVisibleSessionMutualFriendsTargets(filteredContacts)
+        const visibleTargetSet = new Set(visibleTargetIds)
+        const remainingTargetIds = sessionsRef.current
+          .filter((session) => session.hasSession && isSingleContactSession(session.username) && !visibleTargetSet.has(session.username))
+          .map((session) => session.username)
+
+        if (visibleTargetIds.length > 0) {
+          enqueueSessionMutualFriendsRequests(visibleTargetIds, { front: true })
+        }
+        if (remainingTargetIds.length > 0) {
+          enqueueSessionMutualFriendsRequests(remainingTargetIds)
+        }
+        scheduleSessionMutualFriendsWorker()
       }
-      scheduleSessionMutualFriendsWorker()
-    }
 
-    // 记录刷新前的会话时间戳
-    const oldTimestamps = new Map(
-      sessionsRef.current.map(s => [s.username, s.lastTimestamp || s.sortTimestamp || 0])
-    )
+      await Promise.all([
+        loadContactsList({ scopeKey }),
+        loadSnsStats({ full: true }),
+        loadSnsUserPostCounts({ force: true })
+      ])
 
-    await Promise.all([
-      loadContactsList({ scopeKey }),
-      loadSnsStats({ full: true }),
-      loadSnsUserPostCounts({ force: true })
-    ])
+      const refreshedVisibleIds = collectVisibleSessionMetricTargets(filteredContacts)
+      const refreshedVisibleIdSet = new Set(refreshedVisibleIds)
+      const refreshedTabIds = sessionsRef.current
+        .filter(session => session.hasSession && session.kind === activeTabRef.current)
+        .map(session => session.username)
+        .filter((sessionId) => {
+          if (!sessionId || refreshedVisibleIdSet.has(sessionId)) return false
+          return true
+        })
+        .slice(0, SESSION_MEDIA_METRIC_TAB_REFRESH_LIMIT)
+      const refreshTargetIds = [...refreshedVisibleIds, ...refreshedTabIds]
+        .slice(0, SESSION_MEDIA_METRIC_TAB_REFRESH_LIMIT)
+      const refreshTargetSessions = refreshTargetIds
+        .map(sessionId => sessionsRef.current.find(session => session.username === sessionId))
+        .filter((session): session is SessionRow => Boolean(session))
 
-    // 找出有变动的会话（最后消息时间变化）
-    const changedSessions = sessionsRef.current.filter(session => {
-      const oldTs = oldTimestamps.get(session.username) || 0
-      const newTs = session.lastTimestamp || session.sortTimestamp || 0
-      return newTs > oldTs
-    })
+      if (refreshTargetSessions.length > 0) {
+        await loadSessionMessageCounts(refreshTargetSessions, activeTabRef.current, { scopeKey })
+        await refreshSessionMediaMetrics(refreshTargetIds)
+      }
 
-    // 只对有变动的会话重新加载消息数量
-    if (changedSessions.length > 0) {
-      await loadSessionMessageCounts(changedSessions, activeTabRef.current, { scopeKey })
-    }
-
-    const currentDetailSessionId = showSessionDetailPanel
-      ? String(sessionDetail?.wxid || '').trim()
-      : ''
-    if (currentDetailSessionId) {
-      await loadSessionDetail(currentDetailSessionId)
-      void loadSessionRelationStats({ forceRefresh: true })
+      const currentDetailSessionId = showSessionDetailPanel
+        ? String(sessionDetail?.wxid || '').trim()
+        : ''
+      if (currentDetailSessionId) {
+        await loadSessionDetail(currentDetailSessionId)
+        void loadSessionRelationStats({ forceRefresh: true })
+      }
+    } finally {
+      setIsRefreshingTableData(false)
     }
   }, [
     closeSessionMutualFriendsDialog,
     collectVisibleSessionMutualFriendsTargets,
+    collectVisibleSessionMetricTargets,
     enqueueSessionMutualFriendsRequests,
     ensureExportCacheScope,
     filteredContacts,
+    isRefreshingTableData,
     isSessionCountStageReady,
     loadContactsList,
     loadSessionDetail,
     loadSessionRelationStats,
     loadSnsStats,
     loadSnsUserPostCounts,
+    refreshSessionMediaMetrics,
     resetSessionMutualFriendsLoader,
     scheduleSessionMutualFriendsWorker,
+    sessionRowByUsername,
     showSessionDetailPanel,
     sessionDetail?.wxid
   ])
@@ -9644,8 +9748,8 @@ function ExportPage() {
                     </button>
                   )}
                 </div>
-                <button className="secondary-btn" onClick={() => void handleRefreshTableData()} disabled={isContactsListLoading}>
-                  <RefreshCw size={14} className={isContactsListLoading ? 'spin' : ''} />
+                <button className="secondary-btn" onClick={() => void handleRefreshTableData()} disabled={isContactsListLoading || isRefreshingTableData}>
+                  <RefreshCw size={14} className={(isContactsListLoading || isRefreshingTableData) ? 'spin' : ''} />
                   刷新
                 </button>
               </div>
