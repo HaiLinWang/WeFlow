@@ -841,6 +841,30 @@ const resolveAppIconPath = (): string => {
   return join(__dirname, `../public/${iconName}`)
 }
 
+const resolveTrayIconPath = (): string => {
+  const primaryIconPath = resolveAppIconPath()
+  if (!process.env.VITE_DEV_SERVER_URL || process.platform !== 'darwin') {
+    return primaryIconPath
+  }
+
+  const candidates = [
+    primaryIconPath,
+    join(__dirname, '../public/icon.png')
+  ]
+
+  for (const candidate of candidates) {
+    try {
+      if (!nativeImage.createFromPath(candidate).isEmpty()) {
+        return candidate
+      }
+    } catch {
+      // Try the next local icon candidate.
+    }
+  }
+
+  return primaryIconPath
+}
+
 const requestMainWindowCloseConfirmation = (win: BrowserWindow): void => {
   if (isClosePromptVisible) return
   isClosePromptVisible = true
@@ -4353,7 +4377,7 @@ app.whenReady().then(async () => {
   ensureWeChatRequestHeaderInterceptor()
   mainWindow = createWindow({ autoShow: false })
 
-  const resolvedTrayIcon = resolveAppIconPath()
+  const resolvedTrayIcon = resolveTrayIconPath()
 
 
   try {
